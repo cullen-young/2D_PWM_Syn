@@ -1,0 +1,134 @@
+#
+# Linear Acoustic WE operator testing
+#
+try:    from rsf.cluster import *
+except: from rsf.proj    import *
+from rsf.recipes import wplot,geom,awe
+import sys
+#sys.path.append('../../operators/')
+#sys.path.append('../../solvers/')
+from artmOP import artmop2d
+from Gwrapper import *
+from idOP import idop
+from LCG import *
+from aweOP import *
+#from enormOP import *
+#from DPT import DPT
+
+# ------------------------------------------------------------
+# Parameters
+par = dict(nx=801,  ox=0, dx=0.005,  lx='x', ux='km',
+           nz=187,  oz=0, dz=0.005,  lz='z', uz='km',
+           ny=1000, oy=0, dy=0.005,  ly='y', uy='km',
+           nt=3001, ot=0, dt=0.0004, lt='t', ut='s',
+	   nsx=601, dsx=0.005, osx=0.5,
+	   nrx=187,  drx=0.005,
+	   osz=0.01, orx=2.005,
+	   kt=200, jsnap=100,
+	   f1=5, f2=15, f3=80, f4=120,
+	   fhi=100, flo=5, nphi=10, nplo=10,
+    )
+wplot.param(par)
+
+par['nzrefl']=par['nz']/4
+
+# Taper for data (in samples):
+par['taper']=0
+
+# Folder for sources and receivers
+folder_ss = 'ss/'
+folder_rr = 'rr/'
+
+# ------------------------------------------------------------
+# Plot rules
+# 1D
+plotT  ='window | scale axis=123 |' + wplot.waveplot('',par)
+
+# 2D
+plotW2D='window j3=1 |'+ wplot.igrey2d('pclip=98',par)
+plotI2D=wplot.igrey2d('pclip=99',par)
+plotD2D='transp |'      + wplot.dgrey2d('',par)
+
+# 3D
+plotI3D='byte gainpanel=a pclip=99 |' + wplot.igrey3d('mean=y',par)
+plotW3D='window j4=30 | byte gainpanel=a pclip=100 |' + wplot.igrey4d('',par)
+plotD3D='transp | put n2=%(nx)d o2=%(ox)g d2=%(dx)g label2=%(lx)s unit2=%(ux)s n3=%(ny)d o3=%(oy)g d3=%(dy)g label3=%(ly)s unit3=%(uy)s | byte gainpanel=a pclip=100 |'%par + wplot.dgrey3d('',par)
+
+# ------------------------------------------------------------
+# Wavelet
+Flow('wav',None,'/beegfs/sets/cwp/code/RSF/RSF4.2_CU12.2/RSFSRC/user/utils/sformsby nt=%(nt)d dt=%(dt)g ot=%(ot)g kt=%(kt)d f1=%(f1)g f2=%(f2)g f3=%(f3)g f4=%(f4)g | math output="100000000*input" | sfbandpass flo=%(flo)g fhi=%(fhi)g nplo=%(nplo)g nphi=%(nphi)g | transp plane=12'%par)
+Flow('dwav','wav','transp | deriv | transp'%par)
+Flow('iwav','wav','transp | integral1 rule=t | sfbandpass flo=%(flo)g nplo=%(nplo)g | math output="input*exp(-1000*x1^2)" | bandpass flo=%(flo)g nplo=%(nplo)g | transp'%par)
+Result( 'wav',plotT)
+Result('dwav',plotT)
+Result('iwav',plotT)
+
+# ------------------------------------------------------------
+# Sources and Receivers
+tdata = '/beegfs/projects/cwp/AlaskaDAS/data/240_tdata.rsf'
+Flow('soux',tdata,'sfput n3=979 n2=1699 | sfwindow n1=1 f1=21 n3=1 f3=0 | sfdd type=float |sfmath output="(input*0.01-598684)*0.3048"')
+Flow('souy',tdata,'sfput n3=979 n2=1699 | sfwindow n1=1 f1=22 n3=1 f3=0 | sfdd type=float |sfmath output="(input*0.01-5966135)*0.3048"')
+Flow('souz',tdata,'sfput n3=979 n2=1699 | sfwindow n1=1 f1=13 n3=1 f3=0 | sfdd type=float |sfmath output="(input*0.0001)*0.3048"')
+Flow('recx',tdata,'sfput n3=979 n2=1699 | sfwindow n1=1 f1=23 n2=1 f2=0 | sfdd type=float |sfmath output="((input*0.01-598684)*0.3048/1000)+2.0"')
+Flow('recy',tdata,'sfput n3=979 n2=1699 | sfwindow n1=1 f1=24 n2=1 f2=0 | sfdd type=float |sfmath output="(input*0.01-5966135)*0.3048/1000"')
+Flow('recz',tdata,'sfput n3=979 n2=1699 | sfwindow n1=1 f1=12 n2=1 f2=0 | sfdd type=float |sfmath output="(input*0.0001)*0.3048/1000"')
+
+#Flow('rr2D','recx recz','cat axis=2 ${SOURCES[1]} | sftransp')
+
+for iexp in range(par['nsx']):
+	etag  = '-%03d'%iexp
+	par['xsou'] = par['osx']+iexp*par['dsx']
+	par['zsou'] = par['osz']    
+	geom.point2d(folder_ss+'ss2D'+etag,par['xsou'],par['zsou'],'',par)
+
+# ---
+ss2D = [folder_ss+'ss2D'+'-%03d'%iexp for iexp in range(par['nsx'])]
+Flow('allss2D',ss2D,'cat axis=2 ${SOURCES[1:-1]}')
+Plot('allss2D',wplot.ssplot2d(' plotfat=24 ',par))
+
+# ---
+geom.vertical2d('rr2D',par['orx'],'',par)
+
+par['skip']=1
+for iexp in range(par['nrx']):
+	etag = '-%03d'%iexp
+	par['rskip'] = iexp*par['skip']
+	Flow(folder_rr+'rr2D'+etag,'rr2D','window n2=1 f2=%(rskip)d'%par)
+
+# ------------------------------------------------------------
+# velocity
+
+Flow('overthrust_2d',['/beegfs/sets/cwp/data/overthrust/overthrust'],'window n1=%(nx)d n2=1 f2=700 n3=%(nz)d | sftransp | sfput d1=%(dz)g d2=%(dx)g'%par)
+Flow('overthrust_rtm','overthrust_2d','math output="1/input^2" | smooth rect1=3 rect2=3 repeat=2 | math output="1/sqrt(input)"')
+
+## . . reflectivity
+#Flow('refl2D','vp','ai2refl')
+
+# ------------------------------------------------------------
+# Forward Modeling all datasets
+Flow('m1',None,'math n1=1537 d1=0.0002 o1=-0.0392 n2=190 d2=0.005 o1=0 output="0"')
+Flow('m2',None,'math n1=1537 d1=0.0002 o1=-0.0392 n2=185 d2=0.005 o1=0 output="1"')
+Flow('mask','m1 m2','cat axis=2 ${SOURCES[1]} | smooth rect2=3 repeat=3 | rtoc')
+
+for iexp in range(par['nsx']):
+	etag  = '-%03d'%iexp
+	A = aweop2d('overthrust_2d',par,ss2D[iexp],'rr2D','',custom=' verb=y dabc=y ')
+	A.FORW('wav','d'+etag)
+	par['tcut'] = 0
+	Flow('dp'+etag,['d'+etag,'mask'],'transp | fft1 | fft3 | math mask=${SOURCES[1]} output="input*mask" | fft3 inv=y | fft1 inv=y | mutter t0=%(tcut)g v0=100000000 | transp | mutter t0=1.2 v0=1000000000 inner=y'%par)
+
+	Plot('d' +etag,'grey clip=0.1 title="Original"')
+	Plot('dp'+etag,'grey clip=0.1 title="Filtered"')
+
+# Concatenate data:
+dat2D = ['dp'+'-%03d'%iexp for iexp in range(par['nsx'])]
+Flow('alld',dat2D,'cat axis=3 ${SOURCES[1:-1]}')
+
+
+# Taper observed data:
+Flow('alltapd','alld','costaper nw1=%(taper)d'%par)
+
+# Convert to reciprical geometry
+#Flow('alltapd_recip','alltapd','window n1=%(nrx)d j1=%(skip)d | sftransp plane=13 memsize=2000 | sfput d1=%(dsx)g o1=%(osx)g'%par)
+
+End()

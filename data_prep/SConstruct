@@ -1,0 +1,110 @@
+#
+# Linear Acoustic WE operator testing
+#
+try:    from rsf.cluster import *
+except: from rsf.proj    import *
+from rsf.recipes import wplot,geom,awe
+import sys
+#sys.path.append('../../operators/')
+#sys.path.append('../../solvers/')
+from artmOP import artmop2d
+from Gwrapper import *
+from idOP import idop
+from LCG import *
+from aweOP import *
+#from enormOP import *
+#from DPT import DPT
+
+# ------------------------------------------------------------
+# Parameters
+par = dict(nx=801,  ox=0, dx=0.005,  lx='x', ux='km',
+           nz=187,  oz=0, dz=0.005,  lz='z', uz='km',
+           ny=1000, oy=0, dy=0.005,  ly='y', uy='km',
+           nt=3001, ot=0, dt=0.0004, lt='t', ut='s',
+       nsx=601, dsx=0.005, osx=0.5,
+       nrx=187,  drx=0.005,
+       osz=0.01, orx=2.005,
+       kt=200, jsnap=100,
+       f1=5, f2=15, f3=80, f4=120,
+       fhi=100, flo=5, nphi=10, nplo=10,
+    )
+wplot.param(par)
+
+par['nzrefl']=par['nz']/4
+
+# Taper for data (in samples):
+par['taper']=0
+
+# Folder for sources and receivers
+folder_ss = 'ss/'
+folder_rr = 'rr/'
+
+# ------------------------------------------------------------
+# Plot rules
+# 1D
+plotT  ='window | scale axis=123 |' + wplot.waveplot('',par)
+
+# 2D
+plotW2D='window j3=1 |'+ wplot.igrey2d('pclip=98',par)
+plotI2D=wplot.igrey2d('pclip=99',par)
+plotD2D='transp |'      + wplot.dgrey2d('',par)
+
+# 3D
+plotI3D='byte gainpanel=a pclip=99 |' + wplot.igrey3d('mean=y',par)
+plotW3D='window j4=30 | byte gainpanel=a pclip=100 |' + wplot.igrey4d('',par)
+plotD3D='transp | put n2=%(nx)d o2=%(ox)g d2=%(dx)g label2=%(lx)s unit2=%(ux)s n3=%(ny)d o3=%(oy)g d3=%(dy)g label3=%(ly)s unit3=%(uy)s | byte gainpanel=a pclip=100 |'%par + wplot.dgrey3d('',par)
+
+# ------------------------------------------------------------
+# Wavelet
+Flow('wav',None,'/beegfs/sets/cwp/code/RSF/RSF4.2_CU12.2/RSFSRC/user/utils/sformsby nt=%(nt)d dt=%(dt)g ot=%(ot)g kt=%(kt)d f1=%(f1)g f2=%(f2)g f3=%(f3)g f4=%(f4)g | math output="100000000*input" | sfbandpass flo=%(flo)g fhi=%(fhi)g nplo=%(nplo)g nphi=%(nphi)g | transp plane=12'%par)
+Flow('dwav','wav','transp | deriv | transp'%par)
+Flow('iwav','wav','transp | integral1 rule=t | sfbandpass flo=%(flo)g nplo=%(nplo)g | math output="input*exp(-1000*x1^2)" | bandpass flo=%(flo)g nplo=%(nplo)g | transp'%par)
+Result( 'wav',plotT)
+Result('dwav',plotT)
+Result('iwav',plotT)
+
+# ------------------------------------------------------------
+Flow('alltapd_recip','../data/alltapd.rsf','sftransp plane=13 memsize=10000')
+
+for rexp in range(par['nrx']):
+    par['rexp'] = rexp
+    etag = '-%03d'%rexp
+    #par['tcutr'] = 0.0+abs(296-rexp)/296.0*0.11
+    #Flow('alltapd_recip_mute'+etag,'alltapd_recip','window n3=1 f3=%(rexp)d | sftransp | sfmutter x0=%(orx)g t0=%(tcutr)g tp=0.05 v0=5.0 half=n | sftransp'%par)
+    Flow('alltapd_recip_mute'+etag,'alltapd_recip','window n3=1 f3=%(rexp)d'%par)
+
+
+# Concatenate data
+dat2D_mute = ['alltapd_recip_mute'+'-%03d'%rexp for rexp in range(par['nrx'])]
+Flow('alltapd_recip_mute',dat2D_mute,'cat axis=3 ${SOURCES[1:-1]}')
+
+Flow('vp_cut','../data/overthrust_rtm.rsf','window n1=%(nrx)d'%par)
+
+# PWM
+Flow('pwmr_fft','alltapd_recip_mute','sftransp plane=12 memsize=2000 | pad n1=6000 | fft1 | put d3=0.005 | transp plane=34 memsize=2000')
+
+par['np']=401
+par['dp']=0.0005
+par['op']=-0.4
+#par['drp']=10
+#par['orp']=-30
+
+
+Flow('pwmr',['pwmr_fft','vp_cut'],'/beegfs/sets/cwp/code/RSF/RSF4.2_CU12.2/RSFSRC/user/cullenyoung/sfR2P vel=${SOURCES[1]} np=%(np)d dp=%(dp)g op=%(op)g'%par)
+
+for ir in range(par['nrx']):
+    par['ir'] = ir
+    rtag = '-%03d'%ir
+    Flow('pwms_data'+rtag,'wav','sfpad beg1=%(ir)d n1=%(nrx)d'%par)
+#    pfft+ptag = S2P('pwm_fft',par,custom='')
+
+pwmsdat = ['pwms_data'+'-%03d'%ir for ir in range(par['nrx'])]
+
+Flow('pwms_alldat',pwmsdat,'cat axis=3 ${SOURCES[1:-1]}')
+Flow('pwms_fft','pwms_alldat','put d1=0.005 o1=0 d3=0.005 o3=0 | sftransp plane1=12 memsize=2000 | pad n1=6000 | fft1')
+Flow('pwms',['pwms_fft','vp_cut'],'/beegfs/sets/cwp/code/RSF/RSF4.2_CU12.2/RSFSRC/user/cullenyoung/sfS2P vel=${SOURCES[1]} np=%(np)d dp=%(dp)g op=%(op)g'%par)
+Flow('pwmr_ifft','pwmr','fft1 inv=y | sfput d2=0.005 o2=0.5')
+Flow('pwms_ifft','pwms','fft1 inv=y')
+
+End()
+

@@ -1,0 +1,87 @@
+from rsf.proj import *
+
+# ------------------------------------------------------------
+# Parameters
+par = dict(nx=1000, ox=0, dx=0.005,  lx='x', ux='km',
+           nz=296,  oz=0, dz=0.005,  lz='z', uz='km',
+           ny=1000, oy=0, dy=0.005,  ly='y', uy='km',
+           nt=1126, ot=0, dt=0.0008, lt='t', ut='s',
+           nz_t=14,  oz_t=0.0,  dz_t=0.005,
+           nz_m=198, oz_m=0.07, dz_m=0.005,
+           nz_b=84,  oz_b=1.06, dz_b=0.005,
+           nsx=601, dsx=0.005, osx=1.0,
+           nrx=296,  drx=0.005,
+           osz=0.01, orx=2.5,
+           kt=200, jsnap=100,
+           f1=5, f2=10, f3=50, f4=100,
+           fhi=50, flo=5, nphi=10, nplo=10,
+           wantdat='y', wantwf='y', wantillum='y',
+           depth=208, verb='y', imgj=1, itrevmin=50,
+           ictype=1, eps=1e-5,
+          )
+#wplot.param(par)
+
+par['nzrefl']=par['nz']/4
+
+# Taper for data (in samples):
+par['taper']=0
+
+# Folder for sources and receivers
+folder_ss = 'ss/'
+folder_rr = 'rr/'
+
+#-------------------------------------------------------------
+#Perform RTM cross-correlation imaging
+Flow('vp_transp','../data/overthrust_rtm.rsf','transp plane=12 memsize=2000 | sfwindow n1=800 n2=176')
+Flow('vp_pad_lt','vp_transp','window n1=1 f1=0 | transp plane=12 | spray axis=2 n=320 d=0.005 o=-1.6 | transp plane=12 | transp plane=23')
+Flow('vp_pad_rt','vp_transp','window n1=1 f1=799 | transp plane=12 | spray axis=2 n=320 d=0.005 o=4.0 | transp plane=12 | transp plane=23')
+Flow('vp_pad_tmp',['vp_pad_lt','vp_transp','vp_pad_rt'],'cat axis=1 space=n ${SOURCES[1:3]}')
+Flow('vp_pad_tp','vp_pad_tmp','window n2=1 f2=0 | transp plane=12 | spray axis=2 n=208 d=0.005 o=-1.04 | transp plane=13')
+Flow('vp_pad_bt','vp_pad_tmp','window n2=1 f2=175 | transp plane=12 | spray axis=2 n=208 d=0.005 o=0.88  | transp plane=13')
+Flow('vp_pad',['vp_pad_tp','vp_pad_tmp','vp_pad_bt'],'cat axis=2 space=n ${SOURCES[1:3]}')
+
+Flow('img_pad','vp_pad','sfmath output="input*0" | put n3=1 d3=1 | transp plane=23 | transp plane=12 | put o1=0 d1=0.005')
+
+par['npmin'] = 60
+par['npmax'] = 130
+par['nptot'] = par['npmax'] - par['npmin']
+
+Flow('swf_in','../data_prep/pwms_ifft.rsf','''
+    put d1=0.0004 |
+    transp plane=12 memsize=20000 |
+    costaper nw1=10 |
+    pad beg1=208 n1=592 |
+    window min2=0 n2=1099 f3=%(npmin)d n3=%(nptot)d | put d3=1. o3=0. '''%par)
+Flow('rwf_in','../data_prep/pwmr_ifft.rsf','''
+    put d1=0.0004 |
+    transp plane=12 memsize=20000 |
+    transp plane=34 memsize=20000 |
+    costaper nw1=10 |
+    pad beg1=420 n1=1440 |
+    window min2=0 n2=1099 f3=%(npmin)d n3=%(nptot)d | put d1=0.005 o1=-1.6 d3=1 o3=0.'''%par)
+Flow(['rtm_out','data_out','swf_out','rwf_out','illum'],['img_pad','vp_pad','swf_in','rwf_in'],
+        '''
+        /beegfs/sets/cwp/code/RSF/RSF4.2_CU12.2/RSFSRC/user/cwp_gpu/sfrtm2dGPU_DASVSP_CWM
+        vel=${SOURCES[1]}
+        swf=${SOURCES[2]}
+        rwf=${SOURCES[3]}
+        data=${TARGETS[1]}
+        swfout=${TARGETS[2]}
+        rwfout=${TARGETS[3]}
+        illum=${TARGETS[4]}
+        wantdat=%(wantdat)s wantwf=%(wantwf)s wantillum=%(wantillum)s
+        rdepth=%(depth)d wfldj=100 verb=%(verb)s imgj=%(imgj)d
+        itrevmin=%(itrevmin)d ictype=%(ictype)d eps=%(eps)d'''%par)
+
+Flow('illum_transp','illum','window n3=1 | sftransp')
+Flow('rtm','rtm_out','transp plane=13 memsize=2000 | laplace')
+
+Result('rtm_overthrust_70q_highfreq','rtm','window min1=0 max1=.8 min2=1.5 max2=2.5 | bandpass flo=7.5 nplo=10 | grey gainpanel=a font=104 label1="Depth" unit1="km" label2="Distance" unit2="km" title="" screenratio=.4 screenht=6 labelsz=5 pclip=98.0')
+#Result('vp_overthrust_scale','vp_pad','transp | window min1=0 max1=.8 min2=1.5 max2=2.5 | grey gainpanel=a font=104 label1="Depth" unit1="km" label2="Distance" unit2="km" title="" screenratio=.4 screenht=6 color=j mean=y scalebar=y labelsz=5')
+#Result('vp_overthrust','vp_pad','transp | window min1=0 max1=.8 min2=1.5 max2=2.5 | grey gainpanel=a font=104 label1="Depth" unit1="km" label2="Distance" unit2="km" title="" screenratio=.4 screenht=6 color=j mean=y labelsz=5')
+
+#Flow('rtm_illum',['rtm','illum_transp'],'math m1=${SOURCES[0]} m2=${SOURCES[1]} output="m1/(m2+2.5e21)"')
+#Result('rtm_overthrust_70q_highfreq_illum','rtm_illum','window min1=0 max1=.8 min2=1.5 max2=2.5 | bandpass flo=7.5 nplo=10 | grey gainpanel=a font=104 label1="Depth" unit1="km" label2="Distance" unit2="km" title="" screenratio=.4 screenht=6 labelsz=5 pclip=98.0')
+
+End()
+

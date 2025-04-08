@@ -2,6 +2,9 @@
 *
 
 #expect
+!data/
 !data/SConstruct
+!data_prep/
 !data_prep/SConstruct
+!rtm/
 !rtm/SConstruct
