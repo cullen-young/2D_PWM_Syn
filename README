@@ -1,0 +1,7 @@
+Code and Directories used to generate synthetic plane-wave migration images from the SEG/EAGE Overthrust model. 
+
+Data is generated using data/SConstruct. 
+
+This data is passed into data_prep/SConstruct to apply a linear time delay to the source (MS2P) and receiver (MR2P) data.
+
+The time delayed data is passed into rtm/SConstruct which calls Mrtm2dGPU_DASVSP_CWM.cu to perform 2D Reverse Time Migration.
