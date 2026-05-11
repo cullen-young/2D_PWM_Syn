@@ -1,0 +1,331 @@
+#
+# SConstruct_pwrtm: Plane Wave Reverse Time Migration
+#
+# Purpose:
+#   Performs 2D plane wave RTM using the encoded source and receiver wavefields
+#   produced by SConstruct_encode_repo. For each plane wave angle, the source
+#   wavefield is forward propagated and the receiver wavefield is back propagated
+#   using a GPU finite-difference propagator. A zero-lag crosscorrelation imaging
+#   condition is applied at each depth to produce a subsurface reflectivity image.
+#   Individual plane wave images are stacked to form the final RTM image.
+#
+# Workflow summary:
+#   1. Load and pad the Overthrust velocity model for RTM propagation
+#   2. Initialize a zero-valued image volume on the RTM grid
+#   3. Sinc-interpolate encoded wavefields onto the RTM time/space grid
+#   4. Loop over plane wave angles: run RTM propagator, apply illumination correction
+#   5. Stack angle images, apply Laplacian image condition, display result
+#
+# Inputs (from SConstruct_encode_repo):
+#   ../data_prep/pwmrs_ifft.rsf   -- Encoded source wavefield (time domain)
+#   ../data_prep/pwmrr_ifft.rsf   -- Encoded receiver wavefield (time domain)
+#   ../data/overthrust_rtm_pad.rsf -- Padded Overthrust velocity model
+#
+# Dependencies:
+#   - Madagascar (RSF) 4.2
+#   - sfrtm2dGPU_DASVSP_CWM: GPU-accelerated 2D RTM propagator (CWP custom build)
+#   - CUDA-capable GPU
+#
+# Usage:
+#   scons -f SConstruct_pwrtm_repo
+#
+# Primary outputs:
+#   pwm_overthrust_30q_halfint_ic1        -- Final stacked RTM image (Laplacian IC)
+#   pwm_overthrust_30q_halfint_ic1_illum  -- Illumination-corrected stacked image
+#
+
+from rsf.proj import *
+
+# ------------------------------------------------------------
+# Survey and model parameters
+#
+# NOTE ON GRID DIMENSIONS:
+#   nx and nz here define the internal RTM propagation grid, which differs
+#   from the original Overthrust model dimensions in Stages 1 and 2. The
+#   RTM grid is larger because it operates on the fully padded and resampled
+#   velocity model (overthrust_rtm_pad.rsf), which extends beyond the original
+#   model footprint to suppress absorbing boundary artifacts.
+#     nx=1000 covers the padded horizontal extent at 5 m spacing (5.0 km)
+#     nz=296  covers the padded vertical extent at 5 m spacing (1.48 km)
+#
+# NOTE ON TIME AXIS:
+#   nt=1126 and dt=0.0008 s define the RTM internal propagation time axis.
+#   This is distinct from both the forward modeling time axis (Stage 1:
+#   nt=3000, dt=0.0002 s) and the snapshot axis (Stage 2: nt=300, dt=0.002 s).
+#   The encoded wavefields are sinc-resampled onto a finer grid
+#   (n1=5120, d1=0.0002 s) before being passed to the RTM propagator.
+#
+# NOTE ON SOURCE ORIGIN:
+#   osx=0.5 km to match the source array starting position in Stage 1.
+#   The value 1.0 in the uploaded file appeared to be a leftover inconsistency.
+#
+# NOTE ON WAVELET FREQUENCIES:
+#   f1-f4 are not used directly in this stage (no wavelet is generated here)
+#   but are corrected to match Stage 1 (8/20/100/150 Hz) for consistency
+#   across the repository.
+#
+# NOTE ON jsnap:
+#   jsnap=10 to match the snapshot interval used in Stage 1. The value of
+#   100 in the uploaded file appeared to be a carry-over error; this parameter
+#   is not used directly in the RTM flows but should remain consistent.
+# ------------------------------------------------------------
+par = dict(
+    nx=1000, ox=0,   dx=0.005,  lx='x', ux='km',   # Horizontal RTM propagation grid
+    nz=296,  oz=0,   dz=0.005,  lz='z', uz='km',   # Vertical RTM propagation grid
+    ny=1000, oy=0,   dy=0.005,  ly='y', uy='km',   # Unused 3rd axis (placeholder)
+    nt=1126, ot=0,   dt=0.0008, lt='t', ut='s',    # RTM internal propagation time axis
+    # Vertical axis sub-sections used for model padding assembly:
+    nz_t=14,  oz_t=0.0,  dz_t=0.005,              # Top pad: 14 samples above model
+    nz_m=198, oz_m=0.07, dz_m=0.005,              # Model interior: 198 samples
+    nz_b=84,  oz_b=1.06, dz_b=0.005,              # Bottom pad: 84 samples below model
+    nsx=601, dsx=0.005, osx=0.5,                   # Source x-positions (km) -- matches Stage 1
+    nrx=296, drx=0.005,                            # RTM depth grid size (not physical receiver count)
+    osz=0.01, orx=2.5,                             # Source depth and VSP column x-position (km)
+    kt=200,   jsnap=10,                            # Wavelet delay (samples); snapshot interval from Stage 1
+    f1=8,  f2=20, f3=100, f4=150,                  # Ormsby corner frequencies (Hz) -- matches Stage 1
+    fhi=100, flo=5, nphi=10, nplo=10,              # Filter parameters (for reference/downstream use)
+    adj_inj='y',    # Adjoint injection: use adjoint source injection in RTM back-propagation
+    wantdat='n',    # Do not output modeled receiver data
+    wantwf='n',     # Do not save wavefield snapshots during RTM (saves memory/disk)
+    wantillum='y',  # Output illumination map for amplitude correction
+    depth=512,      # Top-pad depth in samples (used to position the free surface in the padded grid)
+    verb='y',       # Verbose output from the RTM propagator
+    imgj=1,         # Image output interval (every time step)
+    itrevmin=50,    # Minimum time-reversal step index (skip early time in back-propagation)
+    ictype=1,       # Imaging condition type: 1 = zero-lag crosscorrelation
+    eps=1e-5,       # Stabilization epsilon for illumination correction
+)
+
+# Depth index of the reflection zone (upper quarter of model)
+par['nzrefl'] = par['nz'] / 4
+
+# Data taper length at edges (in samples); set to 0 (no taper applied here)
+par['taper'] = 0
+
+# Output subdirectories for source and receiver coordinate files
+folder_ss = 'ss/'
+folder_rr = 'rr/'
+
+# ------------------------------------------------------------
+# Plane wave angle subset for RTM
+#
+# The full plane wave basis from Stage 2 spans ntheta=501 angles.
+# For RTM we select a contiguous subset using:
+#   nthetamin: first angle index to use (0-based into the Stage 2 angle axis)
+#   nthetatot: number of angles to migrate
+#   nthetaj:   angle subsampling stride (1 = use every angle)
+#
+# WARNING: These indices must be consistent with the Stage 2 angle axis
+# (otheta=-25.0, dtheta=0.1, ntheta=501). Verify that nthetamin and
+# nthetamin+nthetatot-1 fall within [0, 500] before running.
+#   nthetamin=99  -> angle = -25.0 + 99*0.1  = -15.1 degrees
+#   nthetamax=420 -> angle = -25.0 + 420*0.1 =  17.0 degrees
+#   nthetatot=321 -> covers -15.1 to +17.0 degrees (321 angles at 0.1 deg spacing)
+#
+# nthetamax is stored for reference only; sfrtm2dGPU_DASVSP_CWM uses
+# nthetamin and nthetatot to define the active angle range.
+# ------------------------------------------------------------
+par['nthetamin'] = 99
+par['nthetamax'] = 420   # Corrected from 421 (0-based: last index = nthetamin + nthetatot - 1)
+par['nthetaj']   = 1
+par['nthetatot'] = 321
+
+# ------------------------------------------------------------
+# Velocity model for RTM
+#
+# The padded Overthrust model from Stage 1 is further padded at the top
+# to create a water-column-like layer above the free surface. This prevents
+# the RTM propagator from placing sources above the model boundary.
+#
+# vp_tp:   Spray the top trace of the padded model upward for 'depth' samples
+#          (512 samples = 1.28 km at 2.5 m grid spacing), creating a homogeneous
+#          top pad at the velocity of the shallowest model layer.
+# vp_pad:  Concatenate the top pad with the full padded model along axis 2
+#          to form the complete RTM velocity volume.
+# ------------------------------------------------------------
+Flow('vp_tp', '../data/overthrust_rtm_pad.rsf',
+     'window n2=1 f2=0 | spray axis=2 n=%(depth)d d=0.0025 o=-1.28' % par)
+Flow('vp_pad', 'vp_tp ../data/overthrust_rtm_pad.rsf',
+     'cat axis=2 space=n ${SOURCES[1:-1]}')
+
+# ------------------------------------------------------------
+# Initialize image volume
+#
+# Creates a zero-valued RSF file on the RTM grid. The propagator
+# accumulates the crosscorrelation imaging condition into this volume
+# in-place across all plane wave angles.
+# Axes are reordered and the spatial sampling is set to 2.5 m (0.0025 km)
+# to match the internal propagation grid of sfrtm2dGPU_DASVSP_CWM.
+# ------------------------------------------------------------
+Flow('img_pad', 'vp_pad',
+     'sfmath output="input*0" | put n3=1 d3=1 | transp plane=23 | transp plane=12 | put o1=0 d1=0.0025')
+
+# ------------------------------------------------------------
+# Sinc interpolation and conditioning of encoded wavefields
+#
+# The encoded wavefields from Stage 2 are on a coarser spatial and temporal
+# grid. They are sinc-resampled onto the RTM propagation grid here, then
+# tapered and padded to match the expected dimensions of the propagator.
+#
+# Source wavefield (rswf -- receiver-side source wavefield):
+#   sfsinc n1=384 d1=0.0025 o1=0       -- Resample depth axis to 2.5 m grid (384 levels)
+#   sftransp plane=12                  -- Swap depth and time axes
+#   sfsinc n1=5120 d1=0.0002 o1=-0.04  -- Resample time axis to 0.2 ms grid (5120 samples)
+#   sfhalfint inv=y adj=y              -- Apply adjoint half-integration (part of imaging condition)
+#   sftransp plane=12                  -- Restore axis order
+#
+# rswf_in conditioning:
+#   costaper nw1=50                    -- Cosine taper on the first 50 samples to suppress edge transients
+#   pad beg1=512 n1=1408               -- Zero-pad at start to align with RTM propagation window
+#   window n2=2349 f3=nthetamin        -- Select spatial extent and angle subset
+#   put d3=1. o3=0.                    -- Reset angle axis to integer indexing for propagator
+#
+# Receiver wavefield (rrwf -- receiver-side receiver wavefield):
+#   Same sinc resampling chain; spatial origin o1=0.5 km matches the
+#   VSP receiver column position in the padded model.
+#
+# rrwf_in conditioning:
+#   beg1=999 n1=3200                   -- Larger pad to align receiver wavefield with propagation window
+#   put d1=0.0025 o1=-2.0              -- Set spatial axis to padded model coordinates
+# ------------------------------------------------------------
+Flow('rswf_sinc', '../data_prep/pwmrs_ifft.rsf',
+     'sfsinc n1=384 d1=0.0025 o1=0 | sftransp plane=12 memsize=20000 | sfsinc n1=5120 d1=0.0002 o1=-0.04 | sfhalfint inv=y adj=y | sftransp plane=12 memsize=20000')
+
+Flow('rswf_in', 'rswf_sinc', '''
+    costaper nw1=50 |
+    pad beg1=512 n1=1408 |
+    window n2=2349 f3=%(nthetamin)d n3=%(nthetatot)d j3=%(nthetaj)d | put d3=1. o3=0.''' % par)
+
+Flow('rrwf_sinc', '../data_prep/pwmrr_ifft.rsf',
+     'sfsinc n1=1202 d1=0.0025 o1=0.5 | sftransp plane=12 memsize=20000 | sfsinc n1=5120 d1=0.0002 o1=-0.04 | sfhalfint inv=y adj=y | sftransp plane=12 memsize=20000')
+
+Flow('rrwf_in', 'rrwf_sinc', '''
+    costaper nw1=50 |
+    pad beg1=999 n1=3200 |
+    window n2=2349 f3=%(nthetamin)d n3=%(nthetatot)d j3=%(nthetaj)d | put d1=0.0025 o1=-2.0 d3=1 o3=0.''' % par)
+
+# ------------------------------------------------------------
+# Per-angle RTM loop
+#
+# For each plane wave angle index ipw (0 to nthetatot-1):
+#
+#   rswf_in-NNN / rrwf_in-NNN:
+#     Single-angle slices of the conditioned source and receiver wavefields.
+#
+#   sfrtm2dGPU_DASVSP_CWM:
+#     GPU finite-difference RTM propagator. For each angle:
+#       - Forward propagates the source wavefield from the surface downward
+#       - Back-propagates the receiver wavefield from the receivers upward
+#       - Applies zero-lag crosscorrelation imaging condition (ictype=1)
+#       - Outputs: image (rtm_out), modeled data (data_out, suppressed),
+#                  source/receiver wavefield snapshots (swf_out/rwf_out, suppressed),
+#                  and illumination map (illum)
+#     rdepth:    reference depth sample index in the padded model
+#     wfldj=100: wavefield output decimation interval (every 100 steps)
+#     itrevmin:  skip the first 50 time steps of back-propagation to avoid
+#                imaging artifacts from the direct wave near the surface
+#
+#   illum_window-NNN:
+#     Extracts a 2D slice from the illumination cube (n3=1) for use in
+#     amplitude normalization.
+#
+#   rtm_out_halfint_ic1_illum-NNN:
+#     Illumination-corrected image: divides the RTM image by the illumination
+#     map with stabilization (eps=1e-17 hardcoded in the math expression to
+#     prevent division by zero in unseen regions).
+# ------------------------------------------------------------
+for ipw in range(par['nthetatot']):
+    par['ipw'] = ipw
+    itag = '-%03d' % ipw
+
+    # Extract single-angle source and receiver wavefields
+    Flow('rswf_in' + itag, 'rswf_in', 'window n3=1 f3=%(ipw)d' % par)
+    Flow('rrwf_in' + itag, 'rrwf_in', 'window n3=1 f3=%(ipw)d' % par)
+
+    # GPU RTM: forward + backward propagation with crosscorrelation imaging condition
+    Flow(['rtm_out_halfint_ic1' + itag, 'data_out' + itag,
+          'swf_out' + itag, 'rwf_out' + itag, 'illum' + itag],
+         ['img_pad', 'vp_pad', 'rswf_in' + itag, 'rrwf_in' + itag],
+         '''
+        /beegfs/sets/cwp/code/RSF/RSF4.2_CU12.9.1/RSFSRC/user/cwp_gpu/sfrtm2dGPU_DASVSP_CWM
+        vel=${SOURCES[1]}
+        swf=${SOURCES[2]}
+        rwf=${SOURCES[3]}
+        data=${TARGETS[1]}
+        swfout=${TARGETS[2]}
+        rwfout=${TARGETS[3]}
+        illum=${TARGETS[4]}
+        adj_inj=%(adj_inj)s wantdat=%(wantdat)s wantwf=%(wantwf)s wantillum=%(wantillum)s
+        rdepth=%(depth)d wfldj=100 verb=%(verb)s imgj=%(imgj)d
+        itrevmin=%(itrevmin)d ictype=%(ictype)d eps=%(eps)d''' % par)
+
+    # Extract 2D illumination slice from the illumination cube
+    Flow('illum_window' + itag, 'illum' + itag, 'window n3=1')
+
+    # Apply illumination correction with stabilization to avoid division by zero
+    Flow('rtm_out_halfint_ic1_illum' + itag,
+         ['rtm_out_halfint_ic1' + itag, 'illum_window' + itag],
+         'window | math m2=${SOURCES[1]} output="input/(m2+1e17)"')
+
+# ------------------------------------------------------------
+# Stack and display final RTM images
+#
+# Raw stacked image:
+#   rtm_halfint_ic1_stack:
+#     Concatenate all per-angle images along axis 4, then trim padding (window).
+#
+# Illumination-corrected stacked image:
+#   rtm_halfint_ic1_illum_stack:
+#     Same concatenation for the illumination-corrected per-angle images.
+#
+# Display flows (pwm_overthrust_30q_halfint_ic1*):
+#   window n3=31 j3=8  -- Select 31 angle sub-stacks spaced 8 angles apart
+#                         (sub-angle stack to assess image consistency)
+#   sfstack axis=3     -- Sum over the selected angle subset
+#   laplace            -- Apply Laplacian filter to enhance reflectors
+#                         (equivalent to a second-derivative image condition)
+#   sftransp           -- Orient image for display (depth vertical, distance horizontal)
+#
+# Result flows display the image windowed to the zone of interest:
+#   x: 1.5 to 2.5 km (around the VSP receiver column)
+#   z: 0 to 0.8 km
+# ------------------------------------------------------------
+rtm_out_dat = ['rtm_out_halfint_ic1' + '-%03d' % ipw for ipw in range(par['nthetatot'])]
+Flow('rtm_halfint_ic1_stack', rtm_out_dat,
+     'cat axis=4 ${SOURCES[1:%(nthetatot)d]} | window' % par)
+
+rtm_out_dat_illum = ['rtm_out_halfint_ic1_illum' + '-%03d' % ipw for ipw in range(par['nthetatot'])]
+Flow('rtm_halfint_ic1_illum_stack', rtm_out_dat_illum,
+     'cat axis=4 ${SOURCES[1:%(nthetatot)d]} | window' % par)
+
+# Final stacked RTM image: 30-angle sub-stack with Laplacian imaging condition
+Flow('pwm_overthrust_30q_halfint_ic1', 'rtm_halfint_ic1_stack',
+     'window n3=31 j3=8 | sfstack axis=3 | laplace | sftransp')
+
+Result('pwm_overthrust_30q_halfint_ic1',
+       '''bandpass flo=10 nplo=10 |
+          window min1=0 max1=.8 min2=1.5 max2=2.5 |
+          grey gainpanel=a font=104 label1="Depth" unit1="km"
+               label2="Distance" unit2="km" title=""
+               screenratio=.8 screenht=6 labelsz=7.5 pclip=99.5''')
+
+# Bandpass-filtered version of the same image (identical display; retained for QC comparison)
+Result('pwm_overthrust_30q_halfint_ic1_bandpass', 'pwm_overthrust_30q_halfint_ic1',
+       '''bandpass flo=10 nplo=10 |
+          window min1=0 max1=.8 min2=1.5 max2=2.5 |
+          grey gainpanel=a font=104 label1="Depth" unit1="km"
+               label2="Distance" unit2="km" title=""
+               screenratio=.8 screenht=6 labelsz=7.5 pclip=99.5''')
+
+# Final illumination-corrected stacked image
+Flow('pwm_overthrust_30q_halfint_ic1_illum', 'rtm_halfint_ic1_illum_stack',
+     'window n3=31 j3=8 | sfstack axis=3 | laplace | sftransp')
+
+Result('pwm_overthrust_30q_halfint_ic1_illum',
+       '''bandpass flo=10 nplo=10 |
+          window min1=0 max1=.8 min2=1.5 max2=2.5 |
+          grey gainpanel=a font=104 label1="Depth" unit1="km"
+               label2="Distance" unit2="km" title=""
+               screenratio=.8 screenht=6 labelsz=7.5 pclip=99.5''')
+
+End()

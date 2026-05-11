@@ -1,0 +1,240 @@
+#
+# SConstruct_encode: Plane Wave Phase Encoding
+#
+# Purpose:
+#   Transforms the shot-domain receiver and source wavefields produced by
+#   SConstruct_data_repo into the plane wave (slowness) domain via the
+#   Receiver-to-Plane-wave (R2P) and Source-to-Plane-wave (S2P) operators.
+#   The encoded wavefields serve as inputs to the plane wave RTM in
+#   SConstruct_rtm.
+#
+# Workflow summary:
+#   1. Load and resample the velocity model slice at the VSP receiver column
+#   2. Encode the receiver-side VSP wavefields into plane waves (R2P)
+#   3. Construct per-depth source wavefields with progressive time shifts
+#      and encode them into plane waves (S2P)
+#   4. Inverse FFT both encoded wavefields back to the time domain
+#
+# Inputs (from SConstruct_data_repo):
+#   ../data/overthrust_rtm_pad.rsf       -- Padded Overthrust velocity model
+#   ../data/allwavd_vsp_mute_transp.rsf  -- Muted VSP receiver wavefields (nrx x nsx x nsnap)
+#   ../data/wav.rsf                      -- Reference Ormsby wavelet
+#
+# Dependencies:
+#   - Madagascar (RSF) 4.2
+#   - sfR2P: Receiver-to-plane-wave encoding operator (CWP custom build)
+#   - sfS2P: Source-to-plane-wave encoding operator (CWP custom build)
+#   - rsf.recipes: wplot, geom, awe
+#
+# Usage:
+#   scons -f SConstruct_encode_repo
+#
+# Outputs:
+#   pwmrr_ifft   -- Plane wave encoded receiver wavefield (time domain)
+#   pwmrs_ifft   -- Plane wave encoded source wavefield (time domain)
+#
+
+try:    from rsf.cluster import *
+except: from rsf.proj    import *
+
+from rsf.recipes import wplot, geom, awe
+import sys
+
+# ------------------------------------------------------------
+# Survey and model parameters
+#
+# NOTE ON TIME AXIS:
+#   This stage operates on the wavefield snapshot output from Stage 1.
+#   Stage 1 saves snapshots every jsnap=10 time steps, so the effective
+#   time axis here is decimated relative to the raw modeling grid:
+#     nt   = 300   (3000 raw steps / 10 = 300 snapshots)
+#     dt   = 0.002 s (0.0002 s raw dt * 10 = 0.002 s snapshot interval)
+#
+# NOTE ON RECEIVER COUNT:
+#   nrx=192 reflects the VSP wavefield extraction in Stage 1, where
+#   awavefield_vsp was extracted with n2=192 j2=2 (192 depth levels,
+#   subsampled by 2). This differs from the 187 physical receivers in
+#   the shot modeling geometry.
+#
+# NOTE ON WAVELET FREQUENCIES:
+#   The Ormsby corner frequencies below must match those used in
+#   SConstruct_data_repo (f1=8, f2=20, f3=100, f4=150 Hz). Update
+#   if the Stage 1 wavelet definition is changed.
+# ------------------------------------------------------------
+par = dict(
+    nx=801,  ox=0,   dx=0.005,  lx='x', ux='km',   # Horizontal model axis
+    nz=187,  oz=0,   dz=0.005,  lz='z', uz='km',   # Vertical model axis
+    ny=1000, oy=0,   dy=0.005,  ly='y', uy='km',   # Unused 3rd axis (placeholder)
+    nt=300,  ot=0,   dt=0.002,  lt='t', ut='s',    # Snapshot time axis (decimated from Stage 1)
+    nsx=601, dsx=0.005, osx=0.5,                   # Source x-positions (km), matches Stage 1
+    nrx=192, drx=0.005,                            # Receiver count from VSP extraction in Stage 1
+    nrr=601, nrs=192,                              # nrr: number of shot records; nrs: VSP depth levels
+    osz=0.01, orx=2.005,                           # Source depth and receiver x-position (km)
+    kt=200,                                        # Wavelet delay (samples), matches Stage 1
+    jsnap=10,                                      # Snapshot interval used in Stage 1 (for reference)
+    f1=8,  f2=20, f3=100, f4=150,                  # Ormsby wavelet corner frequencies (Hz) -- must match Stage 1
+    fhi=100, flo=5, nphi=10, nplo=10,              # Additional filter parameters (for downstream use)
+)
+
+# Depth index of the reflection zone (upper quarter of model)
+par['nzrefl'] = par['nz'] / 4
+
+# Data taper length at edges (in samples); set to 0 (no taper applied here)
+par['taper'] = 0
+
+# Output subdirectories for source and receiver coordinate files
+folder_ss = 'ss/'
+folder_rr = 'rr/'
+
+# ------------------------------------------------------------
+# Plane wave angular search parameters
+#
+# The R2P and S2P operators decompose wavefields into plane waves
+# over a range of propagation angles (theta) relative to vertical.
+# The reference velocity v0 is used to convert angle to slowness
+# for the local slant-stack / phase shift operation.
+#
+# ntheta=501 angles from -55 to +55 degrees at 0.2 degree spacing
+# gives full coverage of sub-critical reflections for Overthrust velocities.
+#
+# rsx: integer sample index of the VSP receiver column in the
+#      velocity model (x-index of the fixed horizontal receiver position).
+#      At dx=0.005 km and padded origin, rsx=400 corresponds to x=2.0 km,
+#      which aligns with orx=2.005 km.
+#
+# Slowness axis (np, dp, op): not used directly by sfR2P/sfS2P but
+# retained for reference and potential downstream use.
+# ------------------------------------------------------------
+par['ntheta'] = 501
+par['dtheta'] = 0.05      # Angular step (degrees)
+par['otheta'] = -55.0     # Starting angle (degrees); covers 55 degrees
+par['v0']     = 2.0       # Reference velocity for plane wave decomposition (km/s)
+
+# Integer x-index of the VSP receiver column in the padded velocity model
+par['rsx'] = 400
+
+# Slowness axis parameters (for reference)
+par['np'] = 801
+par['dp'] = 0.0005
+par['op'] = -0.5
+
+# ------------------------------------------------------------
+# Velocity model slice at the VSP receiver column
+#
+# Extracts a 2D depth-time slice of the padded Overthrust velocity model
+# at the VSP receiver column (x = rsx). Processing:
+#   transp        -- Reorder axes to place depth first
+#   window n1=192 j1=2  -- Select 192 depth levels with factor-2 subsampling
+#                          (matches the VSP wavefield extraction in Stage 1)
+#   n2=800 f2=800 j2=2  -- Select 800 time samples starting at sample 800,
+#                          with factor-2 subsampling along the second axis
+# This velocity slice is passed to sfR2P and sfS2P to define the local
+# medium properties for the plane wave decomposition.
+# ------------------------------------------------------------
+Flow('vp_cut', '../data/overthrust_rtm_pad.rsf',
+     'transp | window n1=192 j1=2 n2=800 f2=800 j2=2')
+
+# ------------------------------------------------------------
+# Receiver-side plane wave encoding (R2P)
+#
+# Transforms the muted VSP receiver wavefields from the shot domain
+# into the plane wave (angle) domain using sfR2P.
+#
+# pwmrr_fft:
+#   Prepares the receiver wavefield for frequency-domain encoding:
+#     sftransp plane=12  -- Swap axes 1 and 2 (depth <-> shot index)
+#     pad n1=512         -- Zero-pad time axis to next power of 2 for FFT efficiency
+#     fft1               -- Forward FFT along the time axis
+#     sftransp plane=34  -- Swap axes 3 and 4 to match sfR2P input convention
+#
+# pwmrr:
+#   Applies the R2P operator: for each frequency, performs a
+#   slowness-weighted phase shift across the receiver array to
+#   project the wavefield onto the plane wave basis.
+# ------------------------------------------------------------
+Flow('pwmrr_fft', '../data/allwavd_vsp_mute_transp.rsf',
+     'sftransp plane=12 memsize=20000 | pad n1=512 | fft1 | sftransp plane=34 memsize=20000')
+
+Flow('pwmrr', ['pwmrr_fft', 'vp_cut'],
+     '''/beegfs/sets/cwp/code/RSF/RSF4.2_CU12.9.1/RSFSRC/user/cullenyoung/sfR2P
+        vel=${SOURCES[1]}
+        v0=%(v0)g
+        rsx=%(rsx)d
+        ntheta=%(ntheta)d
+        dtheta=%(dtheta)g
+        otheta=%(otheta)g''' % par)
+
+# ------------------------------------------------------------
+# Source-side plane wave encoding (S2P)
+#
+# Constructs the source wavefield at each VSP receiver depth, then
+# encodes it into the plane wave domain using sfS2P.
+#
+# Per-depth loop (irs = 0 to nrs-1):
+#   pwmrs_data-NNN:
+#     Builds a source wavefield for depth level irs by time-shifting
+#     the reference wavelet (wav.rsf from Stage 1):
+#       window j1=10    -- Subsample by 10 to match snapshot time axis (dt=0.002 s)
+#       transp plane=12 -- Reorder axes
+#       sfpad beg1=irs  -- Zero-pad at the start to introduce a depth-dependent
+#                          time shift; this encodes the downgoing plane wave
+#                          moveout across receiver depths
+#       put d1/d3/n4    -- Set axis metadata to match the survey geometry
+#
+# pwmrs_alldat:
+#   Concatenates all per-depth source wavefields along axis 3.
+#
+# pwmrs_fft:
+#   Prepares for frequency-domain encoding (same axis ordering as pwmrr_fft).
+#
+# pwmrs:
+#   Applies the S2P operator: encodes the source wavefield into the
+#   plane wave domain, symmetric to the R2P receiver encoding.
+# ------------------------------------------------------------
+for irs in range(par['nrs']):
+    par['irs'] = irs
+    rstag = '-%03d' % irs
+
+    Flow('pwmrs_data' + rstag, '../data/wav.rsf',
+         '''window j1=10 |
+            transp plane=12 |
+            sfpad beg1=%(irs)d n1=%(nrs)d |
+            put d1=0.005 o1=0 d3=0.005 o3=0 n4=1 d4=0.005 o4=0''' % par)
+
+pwmrsdat = ['pwmrs_data' + '-%03d' % irs for irs in range(par['nrs'])]
+
+Flow('pwmrs_alldat', pwmrsdat, 'cat axis=3 ${SOURCES[1:-1]}')
+
+Flow('pwmrs_fft', 'pwmrs_alldat',
+     'sftransp plane=12 memsize=20000 | pad n1=512 | fft1')
+
+Flow('pwmrs', ['pwmrs_fft', 'vp_cut'],
+     '''/beegfs/sets/cwp/code/RSF/RSF4.2_CU12.9.1/RSFSRC/user/cullenyoung/sfS2P
+        vel=${SOURCES[1]}
+        v0=%(v0)g
+        rsx=%(rsx)d
+        ntheta=%(ntheta)d
+        dtheta=%(dtheta)g
+        otheta=%(otheta)g''' % par)
+
+# ------------------------------------------------------------
+# Inverse FFT: return encoded wavefields to the time domain
+#
+# pwmrr_ifft:
+#   Receiver plane wave wavefield in the time domain.
+#   fft1 inv=y        -- Inverse FFT along frequency axis
+#   sfput d2/o2/d1    -- Restore correct axis metadata (shot spacing, origin, dt)
+#   transp plane=12   -- Reorder to standard (time x angle x depth) layout
+#   sfwindow          -- Trim any padding introduced by the forward FFT
+#
+# pwmrs_ifft:
+#   Source plane wave wavefield in the time domain.
+#   Same inverse FFT and axis restoration; o2=0.0 (source origin at surface).
+# ------------------------------------------------------------
+Flow('pwmrr_ifft', 'pwmrr',
+     'fft1 inv=y | sfput d2=0.005 o2=0.5 d1=%(dt)g | transp plane=12 memsize=20000 | sfwindow' % par)
+
+Flow('pwmrs_ifft', 'pwmrs',
+     'fft1 inv=y | sfput d2=0.005 o2=0.0 d1=%(dt)g | transp plane=12 memsize=20000' % par)
+
+End()

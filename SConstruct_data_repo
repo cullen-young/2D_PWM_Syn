@@ -1,0 +1,282 @@
+#
+# SConstruct_data: 2D Plane Wave Forward Modeling
+#
+# Purpose:
+#   Generates synthetic 2D seismic shot records using the acoustic wave equation
+#   on the Overthrust velocity model. Each source in the survey is forward modeled
+#   independently using a GPU-accelerated finite-difference wavefield propagator
+#   (sfwfld2d_gpu). The resulting receiver wavefields and VSP-geometry snapshots
+#   are assembled into full survey datasets for use in downstream phase encoding
+#   and plane wave RTM workflows.
+#
+# Workflow summary:
+#   1. Define survey geometry (sources and receivers)
+#   2. Load and condition the Overthrust velocity model (pad, smooth, resample)
+#   3. Generate a Ricker-like bandpass wavelet per source (spatially shifted for plane wave encoding)
+#   4. Run acoustic finite-difference forward modeling for each source
+#   5. Extract and mute VSP-geometry wavefields
+#   6. Concatenate all shot records and wavefields into survey-level datasets
+#
+# Dependencies:
+#   - Madagascar (RSF) 4.2 with GPU wavefield propagator (sfwfld2d_gpu)
+#   - rsf.recipes: wplot, geom, awe
+#   - Overthrust 3D RSF velocity model at the path specified below
+#
+# Usage:
+#   scons -f SConstruct_data
+#
+# Outputs:
+#   alld                      -- All shot receiver records, concatenated (nt x nrx x nsx)
+#   allwavd_vsp_transp        -- All VSP-geometry wavefield snapshots, transposed
+#   allwavd_vsp_mute_transp   -- As above, with direct-wave mute applied
+#
+
+from rsf.proj import *
+from rsf.recipes import wplot, geom, awe
+import sys
+
+# ------------------------------------------------------------
+# Survey and model parameters
+#
+# Spatial grid: nx x nz at 5 m spacing (0.005 km), covering the
+#               Overthrust model footprint in 2D (x-z plane)
+# Time axis:    3000 samples at dt=0.0002 s (0.6 s total record length)
+# Sources:      601 shots spaced 5 m apart, starting at x=0.5 km (osx)
+#               All sources placed at depth z=0.01 km (shallow, near-surface)
+# Receivers:    187 receivers spaced 5 m apart in a vertical (VSP) array
+#               starting at x=2.005 km (fixed horizontal position, variable depth)
+# Wavelet:      Ormsby bandpass, passband 20-100 Hz, tapered 8-150 Hz
+#               Delayed by kt=200 samples to avoid acausal energy
+# Snapshots:    Wavefield saved every jsnap=10 time steps
+# ------------------------------------------------------------
+par = dict(
+    nx=801,  ox=0,   dx=0.005,  lx='x', ux='km',   # Horizontal model axis
+    nz=187,  oz=0,   dz=0.005,  lz='z', uz='km',   # Vertical model axis
+    ny=1000, oy=0,   dy=0.005,  ly='y', uy='km',   # Unused 3rd axis (placeholder)
+    nt=3000, ot=0,   dt=0.0002, lt='t', ut='s',    # Time axis
+    nsx=601, dsx=0.005, osx=0.5,                   # Source x-positions (km)
+    nrx=187, drx=0.005,                            # Receiver count and spacing (km)
+    osz=0.01,                                      # Source depth (km) -- near surface
+    orx=2.005,                                     # Receiver x-position (km) -- fixed (VSP geometry)
+    kt=200,                                        # Wavelet delay (samples)
+    jsnap=10,                                      # Wavefield snapshot interval (time steps)
+    jdata=1,                                       # Receiver data output interval (time steps)
+    f1=8,  f2=20, f3=100, f4=150,                  # Ormsby wavelet corner frequencies (Hz)
+    fhi=100, flo=5, nphi=10, nplo=10,              # Additional filter parameters (for downstream use)
+)
+
+# Depth index of the reflection zone: used to isolate reflections
+# from the upper quarter of the model when constructing masks
+par['nzrefl'] = par['nz'] / 4
+
+# Data taper length at edges (in samples); set to 0 (no taper applied here)
+par['taper'] = 0
+
+# Output subdirectories for source and receiver coordinate files
+folder_ss = 'ss/'
+folder_rr = 'rr/'
+
+# ------------------------------------------------------------
+# Reference wavelet (single, unshifted)
+#
+# Generates an Ormsby bandpass wavelet using sformsby (RSF utility).
+# Scaled by 1e8 to match expected amplitude range for the propagator.
+# This wavelet is used for reference/QC; the per-shot wavelets below
+# carry the plane wave phase shift.
+# ------------------------------------------------------------
+Flow('wav', None, '''
+    /beegfs/sets/cwp/code/RSF/RSF4.2_CU12.9.1/RSFSRC/user/utils/sformsby
+        nt=%(nt)d dt=%(dt)g ot=%(ot)g kt=%(kt)d
+        f1=%(f1)g f2=%(f2)g f3=%(f3)g f4=%(f4)g |
+        math output="100000000*input"
+    ''' % par)
+
+# ------------------------------------------------------------
+# Source and receiver geometry
+#
+# Sources: 601-element horizontal array at shallow depth (osz).
+#          sx holds the x-coordinate; sz holds the fixed depth.
+#          Combined and transposed to produce a [2 x nsx] coordinate array.
+#
+# Receivers: 187-element vertical array at fixed x=orx (VSP geometry).
+#            rx holds the fixed x-coordinate; rz holds depth varying along x1.
+#            Combined and transposed to produce a [2 x nrx] coordinate array.
+# ------------------------------------------------------------
+Flow('sx', None, 'math n1=%(nsx)g d1=%(dsx)g o1=%(osx)g output=x1' % par)
+Flow('sz', None, 'math n1=%(nsx)g d1=%(dsx)g o1=%(osz)g output=%(osz)g' % par)
+Flow('source', 'sx sz', 'cat axis=2 ${SOURCES[1]} | transp')
+
+Flow('rx', None, 'math n1=%(nrx)d d1=%(dsx)g o1=%(orx)g output=%(orx)g' % par)
+Flow('rz', None, 'math n1=%(nrx)d d1=%(dsx)g o1=0 output=x1' % par)
+Flow('receivers', 'rx rz', 'cat axis=2 ${SOURCES[1]} | transp')
+
+# ------------------------------------------------------------
+# Velocity model: Overthrust 2D slice
+#
+# Starting point: a 3D RSF Overthrust model stored on the cluster.
+# Processing chain:
+#   overthrust_2d      -- Extract a 2D (nx x nz) inline slice; fix sampling
+#   overthrust_rtm     -- Smooth the model for RTM migration background velocity:
+#                         convert to slowness squared, smooth (3x3 kernel, 2 passes),
+#                         convert back to velocity, transpose, trim to 800 samples
+#   overthrust_lt/rt   -- Pad the left and right edges by spraying boundary traces
+#                         outward (400 samples = 2 km on each side)
+#   overthrust_tmp     -- Concatenate left pad + model + right pad along axis 1
+#   overthrust_bt      -- Pad the bottom edge by spraying the deepest trace downward
+#                         (261 samples)
+#   overthrust_rtm_pad -- Final padded model: concatenate vertical pad, then
+#                         resample to 2.5 m grid via sinc interpolation to match
+#                         the propagator's internal grid requirements
+#   overthrust_den     -- Constant density model (value=1) matching the padded
+#                         velocity grid, required as a separate input by sfwfld2d_gpu
+# ------------------------------------------------------------
+Flow('overthrust_2d',
+     ['/beegfs/projects/cwp/AlaskaDAS/cullenyoung/3D_CWM_VSP/overthrust/overthrust.rsf'],
+     'window n1=%(nx)d n2=1 f2=700 n3=%(nz)d | sftransp | sfput d1=%(dz)g d2=%(dx)g' % par)
+
+Flow('overthrust_rtm', 'overthrust_2d',
+     'math output="1/input^2" | smooth rect1=3 rect2=3 repeat=2 '
+     '| math output="1/sqrt(input)" | sftransp | sfwindow n1=800')
+
+Flow('overthrust_lt', 'overthrust_rtm',
+     'window n1=1 f1=0   | spray axis=1 n=400 d=0.005 o=-2')
+Flow('overthrust_rt', 'overthrust_rtm',
+     'window n1=1 f1=799 | spray axis=1 n=400 d=0.005 o=4')
+Flow('overthrust_tmp', 'overthrust_lt overthrust_rtm overthrust_rt',
+     'cat axis=1 space=n ${SOURCES[1:-1]}')
+
+Flow('overthrust_bt', 'overthrust_tmp',
+     'window n2=1 f2=186 | spray axis=2 n=261 d=0.005 o=0.935')
+
+Flow('overthrust_rtm_pad', 'overthrust_tmp overthrust_bt',
+     'cat axis=2 space=n ${SOURCES[1:2]} '
+     '| sftransp | sfsinc n1=896 d1=0.0025 o1=0 '
+     '| sftransp | sfsinc n1=3200 d1=0.0025 o1=-2')
+
+Flow('overthrust_den', 'overthrust_rtm_pad',
+     'math output="(input*0)+1"')
+
+# ------------------------------------------------------------
+# Direct-wave mute mask
+#
+# A frequency-domain mask is constructed to mute the direct wave
+# arrival in the VSP receiver records after F-K filtering.
+# The mask transitions from 0 (mute zone) to 1 (pass zone) along
+# the depth axis using spatial smoothing.
+#
+# mask -- Reciprocal geometry (nz=194 pass region, nz=190 transition)
+#
+# The mask is converted to complex (rtoc) for multiplication with
+# the complex-valued F-K spectrum of the wavefield.
+# ------------------------------------------------------------
+Flow('m1', None, 'math n1=301 d1=0.002 o1=-0.0392 n2=194 d2=0.005 o1=0 output="0"')
+Flow('m2', None, 'math n1=301 d1=0.002 o1=-0.0392 n2=190 d2=0.005 o1=0 output="1"')
+Flow('mask', 'm1 m2', 'cat axis=2 ${SOURCES[1]} | smooth rect2=3 repeat=3 | rtoc')
+
+# ------------------------------------------------------------
+# Per-shot forward modeling loop
+#
+# For each source index iexp (0 to nsx-1):
+#
+#   wav-NNN:
+#     Per-shot Ormsby wavelet with a linear time shift applied via zero-padding
+#     at the beginning of the time axis. The shift is pad_exp = (iexp + 500) * 2
+#     samples, introducing a source-index-dependent time delay that encodes the
+#     plane wave moveout across the survey. After padding the time axis is
+#     resampled to 2.5 m spatial grid coordinates (d1=0.0025, o1=-2) to align
+#     with the padded velocity model.
+#
+#   arecfield-NNN:
+#     Receiver wavefield (shot record) at the VSP receiver array.
+#     Dimensions: nt x nrx. Output of sfwfld2d_gpu.
+#
+#   awavefield-NNN:
+#     Full 2D wavefield snapshot cube saved every jsnap time steps.
+#     Dimensions: (nt/jsnap) x nx x nz. Used to extract VSP-position wavefields.
+#
+#   awavefield_vsp-NNN:
+#     Single vertical slice of the wavefield at the VSP receiver column
+#     (f1=1600 selects the time window; n2=192 receivers; j2=2 subsamples depth).
+#
+#   awavefield_vsp_mute-NNN:
+#     Direct-wave-muted version of awavefield_vsp using F-K domain masking:
+#       1. Transpose and pad time axis
+#       2. 2D FFT (time + space)
+#       3. Apply complex mask (zeros direct-wave cone)
+#       4. Inverse 2D FFT
+#       5. Trim time, apply inner mutter (remove very early arrivals)
+#       6. Apply outer mutter (surgical removal of direct wave)
+# ------------------------------------------------------------
+for iexp in range(par['nsx']):
+    etag = '-%03d' % iexp
+    par['iexp'] = iexp
+
+    # Time delay in samples: encodes linear plane wave moveout as a function
+    # of source index, producing a plane wave at a fixed slowness after stacking
+    par['pad_exp'] = (iexp + 500) * 2
+
+    # Per-shot bandpass wavelet with plane-wave time shift
+    Flow('wav' + etag, None, '''
+        /beegfs/sets/cwp/code/RSF/RSF4.2_CU12.9.1/RSFSRC/user/utils/sformsby
+        nt=%(nt)d dt=%(dt)g ot=%(ot)g kt=%(kt)d f1=%(f1)g f2=%(f2)g f3=%(f3)g f4=%(f4)g |
+        math output="100000000*input" |
+        transp plane=12 |
+        pad n1=3200 beg1=%(pad_exp)d |
+        put d1=0.0025 o1=-2''' % par)
+
+    # GPU acoustic finite-difference forward modeling (acoustic wave equation, 2D)
+    # Inputs:  vel (velocity), den (density), source coordinates, receiver coordinates
+    # Outputs: arecfield (recorded receiver data), awavefield (full wavefield snapshots)
+    # Options: dabc=y (absorbing boundary), free=y (free surface), snap=y (save snapshots)
+    Flow(['arecfield' + etag, 'awavefield' + etag],
+         ['wav' + etag, 'overthrust_den', 'source', 'receivers', 'overthrust_rtm_pad'],
+         '''
+        /beegfs/sets/cwp/code/RSF/RSF4.2_CU12.9.1/RSFSRC/user/cwp_gpu/sfwfld2d_gpu
+        den=${SOURCES[1]}
+        rec=${SOURCES[2]}
+        sou=${SOURCES[3]}
+        vel=${SOURCES[4]}
+        wfld=${TARGETS[1]}
+        verb=y dabc=y snap=y wfld_j=%(jsnap)d jdata=%(jdata)d free=y wantwf=y''' % par)
+
+    # Extract the wavefield at the VSP receiver column:
+    # f1=1600 skips the initial wavelet delay window; n2=192 receivers; j2=2 depth subsampling
+    Flow('awavefield_vsp' + etag, 'awavefield' + etag,
+         'window n1=1 f1=1600 n2=192 j2=2')
+
+    # Apply F-K domain direct-wave mute using the reciprocal mask
+    Flow('awavefield_vsp_mute' + etag,
+         ['awavefield_vsp' + etag, 'mask'],
+         '''transp |
+        pad n1=600 d1=0.002 |
+        fft1 | fft3 |
+        math mask=${SOURCES[1]} output="input*mask" |
+        fft3 inv=y | fft1 inv=y |
+        window n1=300 |
+        mutter t0=0 v0=100000000 inner=n |
+        transp |
+        mutter t0=0.75 v0=100000000 inner=y''')
+
+# ------------------------------------------------------------
+# Concatenate all shot records and wavefields into survey volumes
+#
+# alld                       -- All receiver records: [nt x nrx x nsx]
+# allwavd_vsp                -- All VSP wavefield slices: [nsnap x nrx x nsx]
+# allwavd_vsp_transp         -- Transposed: [nrx x nsx x nsnap] with corrected axis labels
+# allwavd_vsp_mute           -- All muted VSP wavefields: [nsnap x nrx x nsx]
+# allwavd_vsp_mute_transp    -- Transposed muted version with corrected axis labels
+# ------------------------------------------------------------
+dat2D = ['arecfield' + '-%03d' % iexp for iexp in range(par['nsx'])]
+Flow('alld', dat2D, 'cat axis=3 ${SOURCES[1:-1]}')
+
+wavdat2D = ['awavefield_vsp' + '-%03d' % iexp for iexp in range(par['nsx'])]
+Flow('allwavd_vsp', wavdat2D, 'cat axis=3 ${SOURCES[1:%(nsx)d]}' % par)
+Flow('allwavd_vsp_transp', 'allwavd_vsp',
+     'sftransp plane=13 memsize=10000 | put d1=0.005 o1=0.5 d3=0.005')
+
+wavdat2Dmute = ['awavefield_vsp_mute' + '-%03d' % iexp for iexp in range(par['nsx'])]
+Flow('allwavd_vsp_mute', wavdat2Dmute, 'cat axis=3 ${SOURCES[1:%(nsx)d]}' % par)
+Flow('allwavd_vsp_mute_transp', 'allwavd_vsp_mute',
+     'sftransp plane=13 memsize=10000 | put d1=0.005 o1=0.5 d3=0.005')
+
+End()
